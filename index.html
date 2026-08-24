@@ -77,7 +77,7 @@ const colors=[
 ];
 
 const id=crypto.randomUUID();
-let channel=null,room="",host=false,players=[],state=null,countdownTimer=null;
+let channel=null,room="",host=false,players=[],state=null,countdownTimer=null,hostPlayerName="Player 1";
 
 const $=x=>document.getElementById(x);
 const lines=[];
@@ -110,7 +110,7 @@ function escapeHtml(s){
   return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-function snapshot(){return {room,players,state}}
+function snapshot(){if(state)state.hostPlayerName=hostPlayerName;return {room,players,state}}
 
 async function send(type,data={}){
   if(channel)await channel.send({type:"broadcast",event:"bingo",payload:{type,room,...data}});
@@ -167,6 +167,9 @@ function render(){
     $("start").textContent=players.length<2
       ?"Start Game (need 2 players)"
       :host?"Start Game":"Waiting for host…";
+    if(host && document.activeElement!==$("playerName") && $("playerName").value===""){
+      $("playerName").value="";
+    }
   }
 }
 
@@ -217,6 +220,7 @@ async function handle(m){
 
   if(m.type==="join"&&host&&state.status==="waiting"){
     if(players.length>=5||players.some(p=>p.id===m.id))return;
+    players[0].name=hostPlayerName;
 
     const number=players.length+1;
     const name=(m.name||"").trim()||("Player "+number);
@@ -233,6 +237,10 @@ async function handle(m){
   if(m.type==="snapshot"){
     players=m.players;
     state=m.state;
+    if(!host && state.hostPlayerName)hostPlayerName=state.hostPlayerName;
+    if(players.length>0 && players[0].id!==id && hostPlayerName){
+      players[0].name=hostPlayerName;
+    }
     render();
 
     if(state.winner!==null&&state.status==="playing"&&host){
@@ -280,6 +288,7 @@ async function connect(c,isHost){
 $("create").onclick=async()=>{
   room="BINGO-"+(1000+Math.floor(Math.random()*9000));
   host=true;
+  hostPlayerName="Player 1";
   players=[{id,name:"Player 1"}];
   state={
     status:"waiting",turn:0,marks:{},
@@ -310,6 +319,10 @@ $("join").onclick=async()=>{
 
 $("start").onclick=async()=>{
   if(!host||players.length<2)return;
+
+  // Player 1's name is finalized when the host starts the game.
+  hostPlayerName=($("playerName").value||"").trim()||"Player 1";
+  if(players.length>0)players[0].name=hostPlayerName;
 
   state.status="playing";
   state.turn=0;
