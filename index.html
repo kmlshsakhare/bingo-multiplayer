@@ -36,7 +36,7 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
     <input id="playerName" maxlength="20" placeholder="Name (optional)">
     <button class="alt" id="join">Join Game</button>
   </div>
-  <div class="muted" id="status" style="margin-top:10px">Connecting…</div>
+  <div class="muted" id="status" style="margin-top:10px">Ready</div>
   <div id="room" class="hide">
     <div class="muted" style="margin-top:14px">GAME CODE</div>
     <div class="code" id="roomCode"></div>
@@ -77,21 +77,25 @@ const colors=[
 ];
 
 const id=crypto.randomUUID();
-let channel=null,room="",host=false,players=[],state=null,countdownTimer=null,hostPlayerName="Player 1";
+let ch=null,room="",host=false,players=[],state=null;
+let countdownTimer=null;
+let lastWinnerRound=null;
 
 const $=x=>document.getElementById(x);
+
 const lines=[];
 for(let r=0;r<5;r++)lines.push([0,1,2,3,4].map(c=>r*5+c));
 for(let c=0;c<5;c++)lines.push([0,1,2,3,4].map(r=>r*5+c));
 lines.push([0,6,12,18,24],[4,8,12,16,20]);
 
 function shuffle(a){
-  for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}
+  for(let i=a.length-1;i>0;i--){
+    const j=Math.floor(Math.random()*(i+1));
+    [a[i],a[j]]=[a[j],a[i]];
+  }
   return a;
 }
 
-/* Generates a 1–25 grid that is guaranteed not to be exactly equal
-   to any grid already in the existing array. */
 function uniqueGrid(existing=[]){
   const base=[...Array(25)].map((_,i)=>i+1);
   let g;
@@ -100,23 +104,21 @@ function uniqueGrid(existing=[]){
   return g;
 }
 
-function playerList(){
-  $("players").innerHTML=$("gamePlayers").innerHTML=players.map((p,i)=>
-    `<div class="player"><span class="dot" style="background:${colors[i][2]}"></span>P${i+1} ${escapeHtml(p.name)}</div>`
-  ).join("");
-}
-
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-function snapshot(){if(state)state.hostPlayerName=hostPlayerName;return {room,players,state}}
-
-async function send(type,data={}){
-  if(channel)await channel.send({type:"broadcast",event:"bingo",payload:{type,room,...data}});
+function snapshot(){
+  return {room,players,state};
 }
 
-async function broadcast(){await send("snapshot",snapshot())}
+async function send(type,data={}){
+  if(ch)await ch.send({type:"broadcast",event:"bingo",payload:{type,room,...data}});
+}
+
+async function broadcast(){
+  await send("snapshot",snapshot());
+}
 
 function completed(pid){
   const g=state.grids[pid]||[];
@@ -127,13 +129,24 @@ function checkWinner(){
   for(const p of players){
     const n=completed(p.id);
     state.lines[p.id]=Math.min(5,n);
-    if(n>=5&&state.winner===null)state.winner=players.findIndex(x=>x.id===p.id);
+    if(n>=5 && state.winner===null){
+      state.winner=players.findIndex(x=>x.id===p.id);
+    }
   }
+}
+
+function renderPlayers(){
+  const html=players.map((p,i)=>
+    `<div class="player"><span class="dot" style="background:${colors[i][2]}"></span>P${i+1} ${escapeHtml(p.name)}</div>`
+  ).join("");
+  $("players").innerHTML=html;
+  $("gamePlayers").innerHTML=html;
 }
 
 function render(){
   if(!state)return;
-  playerList();
+
+  renderPlayers();
   $("roomCode").textContent=room;
 
   if(state.status==="playing"){
@@ -146,12 +159,23 @@ function render(){
       :`${colors[state.turn][3]} Player ${state.turn+1} — ${colors[state.turn][0]} turn`;
 
     const g=state.grids[id]||[];
-    const box=$("grid");box.innerHTML="";
-    g.forEach((n,i)=>{
+    const box=$("grid");
+    box.innerHTML="";
+
+    g.forEach(n=>{
       const b=document.createElement("button");
-      b.className="cell";b.textContent=n;
-      if(state.marks[n]!==undefined)b.classList.add(colors[state.marks[n]][1]);
-      b.disabled=me!==state.turn||state.marks[n]!==undefined||state.winner!==null;
+      b.className="cell";
+      b.textContent=n;
+
+      if(state.marks[n]!==undefined){
+        b.classList.add(colors[state.marks[n]][1]);
+      }
+
+      b.disabled=
+        me!==state.turn ||
+        state.marks[n]!==undefined ||
+        state.winner!==null;
+
       b.onclick=()=>pick(n);
       box.appendChild(b);
     });
@@ -163,46 +187,65 @@ function render(){
     $("lobby").classList.remove("hide");
     $("game").classList.add("hide");
     $("room").classList.remove("hide");
+
     $("start").disabled=!host||players.length<2;
-    $("start").textContent=players.length<2
-      ?"Start Game (need 2 players)"
-      :host?"Start Game":"Waiting for host…";
-    if(host && document.activeElement!==$("playerName") && $("playerName").value===""){
-      $("playerName").value="";
-    }
+    $("start").textContent=
+      players.length<2
+        ?"Start Game (need 2 players)"
+        :host
+          ?"Start Game"
+          :"Waiting for host…";
   }
 }
 
-function showWinnerCountdown(winnerIndex){
-  const modal=$("winnerModal"),title=$("winTitle"),count=$("countdown");
+/* Every client displays the winner modal. Only the host is allowed
+   to commit the next-round state, preventing duplicate restarts. */
+function showWinnerCountdown(winnerIndex,roundId){
+  if(lastWinnerRound===roundId)return;
+  lastWinnerRound=roundId;
+
+  if(countdownTimer)clearInterval(countdownTimer);
+
+  const modal=$("winnerModal");
+  const title=$("winTitle");
+  const count=$("countdown");
+
   const winnerName=players[winnerIndex]?.name||("Player "+(winnerIndex+1));
   title.textContent="🏆 "+winnerName+" BINGO!";
   modal.classList.add("show");
 
-  if(countdownTimer)clearInterval(countdownTimer);
   let n=5;
   count.textContent=n;
 
   countdownTimer=setInterval(async()=>{
     n--;
-    if(n>0){count.textContent=n;return}
+
+    if(n>0){
+      count.textContent=n;
+      return;
+    }
 
     clearInterval(countdownTimer);
     countdownTimer=null;
 
+    // Everyone hides the popup after the same countdown.
+    // Only host actually creates the next state.
     setTimeout(async()=>{
       modal.classList.remove("show");
-      if(!host||!state||state.status!=="playing")return;
 
-      /* Winner starts the next round. Every board is regenerated and
-         checked against all boards already generated for this round. */
+      if(!host||!state||state.status!=="playing")return;
+      if(state.winner===null)return;
+      if(state.round!==roundId)return;
+
       const first=winnerIndex;
+      const used=[];
+
       state.marks={};
       state.lines={};
       state.winner=null;
       state.turn=first;
+      state.round=roundId+1;
 
-      const used=[];
       players.forEach(p=>{
         state.grids[p.id]=uniqueGrid(used);
         used.push(state.grids[p.id]);
@@ -218,9 +261,8 @@ function showWinnerCountdown(winnerIndex){
 async function handle(m){
   if(m.room!==room)return;
 
-  if(m.type==="join"&&host&&state.status==="waiting"){
+  if(m.type==="join" && host && state.status==="waiting"){
     if(players.length>=5||players.some(p=>p.id===m.id))return;
-    players[0].name=hostPlayerName;
 
     const number=players.length+1;
     const name=(m.name||"").trim()||("Player "+number);
@@ -237,20 +279,27 @@ async function handle(m){
   if(m.type==="snapshot"){
     players=m.players;
     state=m.state;
-    if(!host && state.hostPlayerName)hostPlayerName=state.hostPlayerName;
-    if(players.length>0 && players[0].id!==id && hostPlayerName){
-      players[0].name=hostPlayerName;
-    }
+
     render();
 
-    if(state.winner!==null&&state.status==="playing"&&host){
-      // Winner countdown is started only by the host's winning move below.
+    // If a winner snapshot arrives after the event, all non-host clients
+    // still get the popup from the synchronized winner state.
+    if(state.winner!==null && state.status==="playing"){
+      showWinnerCountdown(state.winner,state.round);
     }
     return;
   }
 
-  if(m.type==="pick"&&host&&state.status==="playing"){
-    if(m.player!==state.turn||state.marks[m.number]!==undefined)return;
+  if(m.type==="winner"){
+    // Dedicated winner event ensures every device opens the popup,
+    // including the winning player's device.
+    showWinnerCountdown(m.winner,m.round);
+    return;
+  }
+
+  if(m.type==="pick" && host && state.status==="playing"){
+    if(m.player!==state.turn)return;
+    if(state.marks[m.number]!==undefined)return;
 
     state.marks[m.number]=m.player;
     checkWinner();
@@ -260,27 +309,38 @@ async function handle(m){
       await broadcast();
       render();
     }else{
+      const winningRound=state.round;
       await broadcast();
       render();
-      showWinnerCountdown(state.winner);
+
+      // Broadcast the winner separately so every client shows the popup.
+      await send("winner",{winner:state.winner,round:winningRound});
+      showWinnerCountdown(state.winner,winningRound);
     }
   }
 }
 
 async function connect(c,isHost){
-  room=c;host=isHost;
+  room=c;
+  host=isHost;
 
-  channel=sb.channel("bingo:"+room,{
+  ch=sb.channel("bingo:"+room,{
     config:{broadcast:{self:true},presence:{key:id}}
   });
 
-  channel.on("broadcast",{event:"bingo"},e=>handle(e.payload));
+  ch.on("broadcast",{event:"bingo"},e=>handle(e.payload));
 
-  await channel.subscribe(async status=>{
+  await ch.subscribe(async status=>{
     if(status==="SUBSCRIBED"){
       $("status").textContent="🟢 Realtime connected";
-      await channel.track({id});
-      if(!isHost)await send("join",{id,name:($("playerName").value||"").trim()});
+      await ch.track({id});
+
+      if(!isHost){
+        await send("join",{
+          id,
+          name:($("playerName").value||"").trim()
+        });
+      }
     }
   });
 }
@@ -288,12 +348,22 @@ async function connect(c,isHost){
 $("create").onclick=async()=>{
   room="BINGO-"+(1000+Math.floor(Math.random()*9000));
   host=true;
-  hostPlayerName="Player 1";
+
+  // Player 1 initially stays Player 1.
+  // Their name is finalized when Start Game is clicked.
   players=[{id,name:"Player 1"}];
+
   state={
-    status:"waiting",turn:0,marks:{},
-    grids:{[id]:uniqueGrid([])},lines:{[id]:0},winner:null
+    status:"waiting",
+    turn:0,
+    marks:{},
+    grids:{[id]:uniqueGrid([])},
+    lines:{[id]:0},
+    winner:null,
+    round:1,
+    hostPlayerName:"Player 1"
   };
+
   await connect(room,true);
   render();
 };
@@ -308,10 +378,20 @@ $("join").onclick=async()=>{
   }
 
   const c="BINGO-"+digits;
-  $("status").textContent="Joining…";
-  host=false;players=[];
 
-  state={status:"waiting",turn:0,marks:{},grids:{},lines:{},winner:null};
+  $("status").textContent="Joining…";
+  host=false;
+  players=[];
+
+  state={
+    status:"waiting",
+    turn:0,
+    marks:{},
+    grids:{},
+    lines:{},
+    winner:null,
+    round:1
+  };
 
   await connect(c,false);
   render();
@@ -320,15 +400,17 @@ $("join").onclick=async()=>{
 $("start").onclick=async()=>{
   if(!host||players.length<2)return;
 
-  // Player 1's name is finalized when the host starts the game.
-  hostPlayerName=($("playerName").value||"").trim()||"Player 1";
-  if(players.length>0)players[0].name=hostPlayerName;
+  // P1 name is finalized only now.
+  const hostName=($("playerName").value||"").trim()||"Player 1";
+  players[0].name=hostName;
+  state.hostPlayerName=hostName;
 
   state.status="playing";
   state.turn=0;
   state.marks={};
   state.lines={};
   state.winner=null;
+  state.round=1;
 
   const used=[];
   players.forEach(p=>{
@@ -343,7 +425,13 @@ $("start").onclick=async()=>{
 
 async function pick(n){
   const p=players.findIndex(x=>x.id===id);
-  if(!state||state.status!=="playing"||p!==state.turn||state.marks[n]!==undefined)return;
+
+  if(!state||
+     state.status!=="playing"||
+     p!==state.turn||
+     state.marks[n]!==undefined||
+     state.winner!==null)return;
+
   await send("pick",{player:p,number:n});
 }
 </script>
