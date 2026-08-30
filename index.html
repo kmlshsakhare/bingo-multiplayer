@@ -397,7 +397,11 @@ async function announcePlayerLeft(leftId){
   state.leftPlayerName=leftName;
   state.leftPlayerId=leftId;
 
-  await send("player_left",{name:leftName});
+  await send("player_left",{
+    name:leftName,
+    players,
+    state
+  });
   await broadcast();
   render();
   showPlayerLeft(leftName);
@@ -461,8 +465,13 @@ async function handle(m){
   }
 
   if(m.type==="player_left"){
-    state.status="paused";
-    state.winner=null;
+    // The host sends the updated roster with the leave event.
+    if(Array.isArray(m.players))players=m.players;
+    if(m.state)state=m.state;
+    else {
+      state.status="paused";
+      state.winner=null;
+    }
     render();
     showPlayerLeft(m.name||"A player");
     return;
@@ -472,6 +481,13 @@ async function handle(m){
     players=m.players;
     state=m.state;
     if(!state.mode)state.mode="multi";
+
+    // A restart snapshot means the leave event has been resolved.
+    // Close the stale "Player Left" popup on every remaining player's device.
+    if(state.status==="playing"){
+      $("leaveModal").classList.remove("show");
+      $("restartRemaining").disabled=false;
+    }
 
     render();
 
