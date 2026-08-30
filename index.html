@@ -448,11 +448,10 @@ async function confirmExit(){
     const remaining=players.filter(p=>p.id!==id);
 
     if(remaining.length<2){
-      await send("player_left",{
+      await send("final_player_left",{
         senderId:id,
         name:me?.name||"A player",
-        players:remaining,
-        finalPlayer:true
+        players:remaining
       });
     }else if(host){
       // Host exit: do not transfer ANY game state. The next player becomes
@@ -497,7 +496,7 @@ function showPlayerLeftAndReturnHome(name){
   $("leaveTitle").textContent="🚪 "+name+" Left";
   $("leaveSub").textContent="The game has ended because only one player remains.";
   $("restartRemaining").classList.add("hide");
-  $("leaveWait").textContent="Returning to the home page…";
+  $("leaveWait").textContent="You will return to the home page in a moment…";
   $("leaveModal").classList.add("show");
 
   if(typeof vibrate==="function")vibrate([120,70,120]);
@@ -593,8 +592,19 @@ async function checkPresence(){
       const departed=players.find(p=>p.id!==id&&!active.has(p.id));
       const departedName=departed?.name||"A player";
       state.status="closed";
-      render();
+
+      // If this is the remaining player, show the notification immediately.
       showPlayerLeftAndReturnHome(departedName);
+
+      // Also tell any other still-subscribed client about the final departure.
+      // This is harmless if there is only one subscriber left.
+      if(departed && id!==departed.id){
+        send("final_player_left",{
+          senderId:id,
+          name:departedName,
+          players:remaining
+        });
+      }
     }
     return;
   }
@@ -678,7 +688,7 @@ async function handle(m){
   }
 
   if(m.type==="room_closed"){
-    if(exitingGame)return;
+    if(exitingGame || m.senderId===id)return;
     state={...(state||{}),status:"closed"};
     render();
     showPlayerLeftAndReturnHome(m.name||"A player");
@@ -709,6 +719,17 @@ async function handle(m){
     if(host){
       restartAfterDeparture();
     }
+    return;
+  }
+
+  if(m.type==="final_player_left"){
+    if(exitingGame || m.senderId===id)return;
+
+    if(Array.isArray(m.players))players=m.players;
+    state={...(state||{}),status:"closed",winner:null};
+
+    render();
+    showPlayerLeftAndReturnHome(m.name||"A player");
     return;
   }
 
