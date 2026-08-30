@@ -396,8 +396,6 @@ function otherConnectedPlayers(){
 
 function goHome(){
   if(countdownTimer)clearInterval(countdownTimer);
-  if(presenceTimer)clearInterval(presenceTimer);
-  presenceTimer=null;
   if(ch){
     try{ch.untrack()}catch(e){}
     try{sb.removeChannel(ch)}catch(e){}
@@ -438,37 +436,38 @@ async function requestExit(){
   }
 
   $("exitModal").classList.add("show");
-  const title=$("exitModal").querySelector(".exitTitle");
-  const sub=$("exitModal").querySelector(".exitSub");
-  if(host){
-    title.textContent="Exit Game?";
-    sub.textContent="You are the host. Another connected player will automatically become the new host and the game will continue.";
-  }else{
-    title.textContent="Exit Game?";
-    sub.textContent="You are currently playing with other players. If you exit, the game will stop briefly and the remaining players can continue/restart.";
-  }
 }
 
 async function confirmExit(){
   if(!state)return;
   exitingGame=true;
 
-  // Tell other players explicitly as well as relying on presence.
   const me=players.find(p=>p.id===id);
   if(ch){
     const remaining=players.filter(p=>p.id!==id);
-    if(host && remaining.length>=2){
-      // First remaining player becomes the deterministic new host.
+
+    if(remaining.length<2){
+      // After this exit fewer than two multiplayer players remain.
+      await send("room_closed",{reason:"Not enough players"});
+    }else if(host){
+      // Never transfer the running board. Pause it and require the new host
+      // to start a fresh round with the remaining players.
       const newHostId=remaining[0].id;
-      const nextState={...state,status:"playing",winner:null};
+      const pausedState={
+        ...state,
+        status:"paused",
+        winner:null,
+        marks:{},
+        lines:{},
+        leftPlayerName:me?.name||"Host",
+        leftPlayerId:id
+      };
       await send("host_left",{
         name:me?.name||"Host",
         players:remaining,
-        state:nextState,
+        state:pausedState,
         newHostId
       });
-    }else if(remaining.length<2){
-      await send("room_closed",{reason:"Not enough players"});
     }else{
       await send("player_left",{
         name:me?.name||"A player",
@@ -500,7 +499,7 @@ async function announcePlayerLeft(leftId){
 
   const leftName=players[idx].name||("Player "+(idx+1));
   players=players.filter(p=>p.id!==leftId);
-  state.status=players.length<2?"closed":"paused";
+  state.status="paused";
   state.winner=null;
   state.leftPlayerName=leftName;
   state.leftPlayerId=leftId;
@@ -510,26 +509,19 @@ async function announcePlayerLeft(leftId){
     players,
     state
   });
-
-  if(players.length<2){
-    await send("room_closed",{reason:"Not enough players"});
-    goHome();
-    return;
-  }
-
   await broadcast();
   render();
   showPlayerLeft(leftName);
 }
 
 function checkPresence(){
-  if(!ch||!state||state.mode==="computer"||state.status==="waiting")return;
+  if(!ch||!state||state.mode==="computer"||state.status==="waiting"||state.status==="closed")return;
 
   const ps=ch.presenceState();
   const active=new Set(Object.keys(ps));
   const remaining=players.filter(p=>active.has(p.id));
 
-  // If only one player remains, multiplayer cannot continue.
+  // Multiplayer cannot continue with only one connected player.
   if(remaining.length<=1){
     if(state.status!=="waiting"){
       state.status="closed";
@@ -544,31 +536,33 @@ function checkPresence(){
   const hostPlayer=players[0];
   const hostIsPresent=hostPlayer && active.has(hostPlayer.id);
 
-  // The original host left. Elect the first still-connected player
-  // deterministically, so two clients cannot choose different hosts.
+  // Host closed the tab/browser without using Exit Game.
   if(!hostIsPresent){
     const newHost=remaining[0];
     players=remaining;
+    host=(id===newHost.id);
 
-    if(id===newHost.id){
-      host=true;
-      leaveHandled=false;
-      state.status="playing";
-      state.turn=Math.min(state.turn,players.length-1);
-      state.winner=null;
-      state.leftPlayerName=null;
-      state.leftPlayerId=null;
-      broadcast();
-      render();
-    }else{
-      host=false;
-      state.status="playing";
-      render();
-    }
+    state.status="paused";
+    state.winner=null;
+    state.leftPlayerName=hostPlayer?.name||"Host";
+    state.leftPlayerId=hostPlayer?.id||null;
+    leaveHandled=false;
+
+    // Synchronize the paused state. Every remaining device gets the popup;
+    // only the elected host gets the restart button.
+    send("host_left",{
+      name:state.leftPlayerName,
+      players,
+      state,
+      newHostId:newHost.id
+    });
+
+    render();
+    showPlayerLeft(state.leftPlayerName);
     return;
   }
 
-  // Normal player departure: only the current host pauses/restarts.
+  // Normal player departure: only the current host handles it.
   if(host){
     const missing=players.find(p=>p.id!==id&&!active.has(p.id));
     if(missing)announcePlayerLeft(missing.id);
@@ -577,7 +571,7 @@ function checkPresence(){
 
 async function restartWithRemaining(){
   if(!host||!state||state.mode==="computer")return;
-  if(players.length<1)return;
+  if(players.length<2){goHome();return;}
 
   $("restartRemaining").disabled=true;
   const used=[];
@@ -624,48 +618,42 @@ async function handle(m){
     return;
   }
 
-  if(m.type==="room_closed"){
-    if(exitingGame)return;
-    $("leaveModal").classList.remove("show");
-    $("winnerModal").classList.remove("show");
-    if(state)state.status="closed";
-    render();
-    setTimeout(goHome,200);
-    return;
-  }
-
   if(m.type==="host_left"){
     if(exitingGame)return;
 
     if(Array.isArray(m.players))players=m.players;
     if(m.state)state=m.state;
+
     if(players.length<2){
       goHome();
       return;
     }
 
-    const newHostId=m.newHostId;
-    host=(id===newHostId);
-    state.status="playing";
+    host=(id===(m.newHostId||players[0].id));
+    state.status="paused";
     state.winner=null;
+    state.leftPlayerName=m.name||"Host";
+    state.leftPlayerId=m.leftPlayerId||null;
     leaveHandled=false;
 
-    if(host)await broadcast();
     render();
+    showPlayerLeft(m.name||"Host");
     return;
   }
 
   if(m.type==="player_left"){
     if(exitingGame)return;
 
+    // The sender includes the updated roster/state so everyone sees the
+    // same player list immediately.
     if(Array.isArray(m.players))players=m.players;
     if(m.state)state=m.state;
     else {
       state.status="paused";
       state.winner=null;
     }
-
     if(players.length<2){
+      $("leaveModal").classList.remove("show");
       if(host)await send("room_closed",{reason:"Not enough players"});
       goHome();
       return;
@@ -744,8 +732,6 @@ async function connect(c,isHost){
     if(status==="SUBSCRIBED"){
       $("status").textContent="🟢 Realtime connected";
       await ch.track({id});
-      if(presenceTimer)clearInterval(presenceTimer);
-      presenceTimer=setInterval(checkPresence,1500);
 
       if(!isHost){
         await send("join",{
