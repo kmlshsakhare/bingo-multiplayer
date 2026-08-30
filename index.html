@@ -35,6 +35,15 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
 
 <section class="card" id="lobby">
   <div class="row">
+    <select id="mode" style="padding:12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit">
+      <option value="multi">👥 Multiplayer</option>
+      <option value="computer">🤖 vs Computer</option>
+    </select>
+    <select id="difficulty" class="hide" style="padding:12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit">
+      <option value="easy">Easy</option>
+      <option value="normal" selected>Normal</option>
+      <option value="hard">Hard</option>
+    </select>
     <button id="create">Create Game</button>
     <input id="code" maxlength="20" placeholder="Enter 4-digit code (e.g. 1423)">
     <input id="playerName" maxlength="20" placeholder="Name (optional)">
@@ -81,7 +90,7 @@ const colors=[
 ];
 
 const id=crypto.randomUUID();
-let ch=null,room="",host=false,players=[],state=null;
+let ch=null,room="",host=false,players=[],state=null,computerBusy=false;
 let countdownTimer=null;
 let lastWinnerRound=null;
 
@@ -339,10 +348,11 @@ function showWinnerCountdown(winnerIndex,roundId){
         state.lines[p.id]=0;
       });
 
-      await broadcast();
+      if(state.mode!=="computer")await broadcast();
       render();
-      soundNewRound();
-      vibrate([60,50,60]);
+      if(typeof soundNewRound==="function")soundNewRound();
+      if(typeof vibrate==="function")vibrate([60,50,60]);
+      if(state.mode==="computer" && state.turn===1)setTimeout(computerTurn,250);
     },1000);
   },1000);
 }
@@ -365,7 +375,7 @@ async function handle(m){
     return;
   }
 
-  if(m.type==="snapshot"){
+  if(m.type==="snapshot" && state?.mode!=="computer"){
     players=m.players;
     state=m.state;
 
@@ -447,7 +457,42 @@ $("hapticToggle").onclick=()=>{
   if(hapticOn)vibrate(60);
 };
 
+$("mode").onchange=()=>{
+  const computer=$("mode").value==="computer";
+  $("difficulty").classList.toggle("hide",!computer);
+  $("code").classList.toggle("hide",computer);
+  $("join").classList.toggle("hide",computer);
+};
+
 $("create").onclick=async()=>{
+  gameMode=$("mode").value;
+  const playerName=($("playerName").value||"").trim()||"Player 1";
+
+  if(gameMode==="computer"){
+    host=true;
+    room="LOCAL";
+    players=[{id,name:playerName},{id:"computer",name:"Computer"}];
+
+    const used=[];
+    const playerGrid=uniqueGrid(used); used.push(playerGrid);
+    const computerGrid=uniqueGrid(used);
+
+    state={
+      status:"playing",turn:0,marks:{},
+      grids:{[id]:playerGrid,computer:computerGrid},
+      lines:{[id]:0,computer:0},winner:null,round:1,
+      mode:"computer",difficulty:$("difficulty").value,
+      hostPlayerName:playerName
+    };
+
+    $("status").textContent="🤖 Playing vs Computer";
+    $("lobby").classList.add("hide");
+    $("game").classList.remove("hide");
+    render();
+    if(typeof initAudio==="function")initAudio();
+    return;
+  }
+
   room="BINGO-"+(1000+Math.floor(Math.random()*9000));
   host=true;
 
@@ -463,7 +508,7 @@ $("create").onclick=async()=>{
     lines:{[id]:0},
     winner:null,
     round:1,
-    hostPlayerName:"Player 1"
+    hostPlayerName:"Player 1",mode:"multi"
   };
 
   await connect(room,true);
@@ -525,6 +570,85 @@ $("start").onclick=async()=>{
   render();
 };
 
+
+function aiChooseNumber(){
+  const g=state.grids.computer||[];
+  const available=g.filter(n=>state.marks[n]===undefined);
+  if(!available.length)return null;
+
+  if(state.difficulty==="easy"){
+    return available[Math.floor(Math.random()*available.length)];
+  }
+
+  const humanGrid=state.grids[id]||[];
+  const score=new Map(available.map(n=>[n,0]));
+
+  // Prefer an immediate computer win.
+  for(const line of lines){
+    const nums=line.map(i=>g[i]);
+    const missing=nums.filter(n=>state.marks[n]===undefined);
+    if(missing.length===1 && score.has(missing[0]))
+      score.set(missing[0],score.get(missing[0])+100);
+  }
+
+  // Normal/Hard can block the human's immediate win.
+  for(const line of lines){
+    const nums=line.map(i=>humanGrid[i]);
+    const missing=nums.filter(n=>state.marks[n]===undefined);
+    if(missing.length===1 && score.has(missing[0]))
+      score.set(missing[0],score.get(missing[0])+(state.difficulty==="hard"?90:45));
+  }
+
+  // Hard also values building its own lines.
+  if(state.difficulty==="hard"){
+    for(const line of lines){
+      const nums=line.map(i=>g[i]);
+      const missing=nums.filter(n=>state.marks[n]===undefined);
+      if(missing.length===2){
+        missing.forEach(n=>{if(score.has(n))score.set(n,score.get(n)+15)});
+      }
+    }
+  }
+
+  const max=Math.max(...available.map(n=>score.get(n)||0));
+  const best=available.filter(n=>(score.get(n)||0)===max);
+  return best[Math.floor(Math.random()*best.length)];
+}
+
+async function computerTurn(){
+  if(!state||state.mode!=="computer"||state.status!=="playing"||
+     state.turn!==1||state.winner!==null||computerBusy)return;
+
+  computerBusy=true;
+  const delay=state.difficulty==="hard"?650:state.difficulty==="normal"?900:1150;
+  await new Promise(r=>setTimeout(r,delay));
+
+  if(!state||state.turn!==1||state.winner!==null){
+    computerBusy=false;return;
+  }
+
+  const n=aiChooseNumber();
+  if(n===null){computerBusy=false;return;}
+
+  if(typeof soundNumber==="function")soundNumber();
+  if(typeof vibrate==="function")vibrate(50);
+
+  state.marks[n]=1;
+  checkWinner();
+
+  if(state.winner===null){
+    state.turn=0;
+    render();
+    if(typeof soundTurn==="function")soundTurn();
+    if(typeof vibrate==="function")vibrate([60,80,60]);
+  }else{
+    render();
+    showWinnerCountdown(state.winner,state.round);
+  }
+
+  computerBusy=false;
+}
+
 async function pick(n){
   const p=players.findIndex(x=>x.id===id);
 
@@ -536,6 +660,23 @@ async function pick(n){
 
   soundNumber();
   vibrate(50);
+  if(state.mode==="computer"){
+    state.marks[n]=0;
+    checkWinner();
+
+    if(state.winner===null){
+      state.turn=1;
+      render();
+      if(typeof soundTurn==="function")soundTurn();
+      if(typeof vibrate==="function")vibrate([60,80,60]);
+      setTimeout(computerTurn,180);
+    }else{
+      render();
+      showWinnerCountdown(state.winner,state.round);
+    }
+    return;
+  }
+
   await send("pick",{player:p,number:n});
 }
 </script>
