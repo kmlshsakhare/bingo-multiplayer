@@ -449,41 +449,18 @@ async function confirmExit(){
     if(remaining.length<2){
       await send("room_closed",{reason:"Not enough players"});
     }else if(host){
-      const freshGrids={};
-      const used=[];
-      const freshLines={};
-
-      remaining.forEach(p=>{
-        freshGrids[p.id]=uniqueGrid(used);
-        used.push(freshGrids[p.id]);
-        freshLines[p.id]=0;
-      });
-
-      const freshState={
-        mode:"multi",
-        status:"playing",
-        round:(state.round||1)+1,
-        turn:0,
-        marks:{},
-        lines:freshLines,
-        grids:freshGrids,
-        winner:null,
-        leftPlayerName:me?.name||"Host",
-        leftPlayerId:id
-      };
-
-      // First remaining player is the new host.
+      // Do NOT send a playing state. The remaining players first see the
+      // leave popup; the new host then creates a genuinely fresh round.
       await send("host_left",{
         name:me?.name||"Host",
         players:remaining,
-        state:freshState,
         newHostId:remaining[0].id,
         autoRestart:true
       });
     }else{
       await send("player_left",{
         name:me?.name||"A player",
-        players:players.filter(p=>p.id!==id),
+        players:remaining,
         state:{...state,status:"paused",winner:null}
       });
     }
@@ -547,38 +524,25 @@ async function checkPresence(){
   const oldHost=players[0];
   const hostIsPresent=oldHost && active.has(oldHost.id);
 
-  if(!hostIsPresent && host){
+  if(!hostIsPresent){
     const newHost=remaining[0];
-    const freshGrids={};
-    const used=[];
-    const freshLines={};
 
-    remaining.forEach(p=>{
-      freshGrids[p.id]=uniqueGrid(used);
-      used.push(freshGrids[p.id]);
-      freshLines[p.id]=0;
-    });
+    // Only the deterministic next host initiates the migration. This avoids
+    // two remaining phones creating two different rounds.
+    if(id===newHost.id){
+      players=remaining;
+      host=true;
+      leaveHandled=false;
 
-    const freshState={
-      mode:"multi",
-      status:"playing",
-      round:(state.round||1)+1,
-      turn:0,
-      marks:{},
-      lines:freshLines,
-      grids:freshGrids,
-      winner:null,
-      leftPlayerName:oldHost?.name||"Host",
-      leftPlayerId:oldHost?.id||null
-    };
+      await send("host_left",{
+        name:oldHost?.name||"Host",
+        players,
+        newHostId:newHost.id,
+        autoRestart:true
+      });
 
-    await send("host_left",{
-      name:oldHost?.name||"Host",
-      players:remaining,
-      state:freshState,
-      newHostId:newHost.id,
-      autoRestart:true
-    });
+      startFreshAfterHostExit(oldHost?.name||"Host");
+    }
     return;
   }
 
@@ -588,9 +552,47 @@ async function checkPresence(){
   }
 }
 
+async function startFreshAfterHostExit(leftName){
+  if(!host||!state||players.length<2)return;
+
+  // Keep the leave popup visible briefly, then create the new game locally
+  // and broadcast the fresh state. This guarantees the new host never gets
+  // the old host's marks, turn, winner, or grid.
+  await new Promise(resolve=>setTimeout(resolve,1600));
+
+  const used=[];
+  const freshGrids={};
+  const freshLines={};
+
+  players.forEach(p=>{
+    freshGrids[p.id]=uniqueGrid(used);
+    used.push(freshGrids[p.id]);
+    freshLines[p.id]=0;
+  });
+
+  state={
+    mode:"multi",
+    status:"playing",
+    round:(state.round||1)+1,
+    turn:0,
+    marks:{},
+    lines:freshLines,
+    grids:freshGrids,
+    winner:null,
+    leftPlayerName:null,
+    leftPlayerId:null
+  };
+
+  $("leaveModal").classList.remove("show");
+  await broadcast();
+  render();
+  if(typeof soundNewRound==="function")soundNewRound();
+  if(typeof vibrate==="function")vibrate([60,50,60]);
+}
+
 async function restartWithRemaining(){
   if(!host||!state||state.mode==="computer")return;
-  if(players.length<1)return;
+  if(players.length<2){goHome();return;}
 
   $("restartRemaining").disabled=true;
   const used=[];
@@ -647,31 +649,23 @@ async function handle(m){
     if(exitingGame)return;
 
     if(Array.isArray(m.players))players=m.players;
-    if(m.state)state=m.state;
+    host=(id===(m.newHostId||players[0]?.id));
 
     if(players.length<2){
       goHome();
       return;
     }
 
-    // New host is deterministic: first remaining player.
-    host=(id===(m.newHostId||players[0].id));
-
-    // Use the fresh state from the host. Old marks/turn/grids are gone.
-    state.status="playing";
-    state.winner=null;
+    // Do not apply the old game state. Pause locally while showing the leave
+    // notification, then let the new host generate a completely new round.
+    state={...(state||{}),status:"paused",winner:null,marks:{},lines:{}};
     leaveHandled=false;
 
     render();
     showPlayerLeft(m.name||"Host");
 
-    if(m.autoRestart){
-      setTimeout(()=>{
-        $("leaveModal").classList.remove("show");
-        render();
-        if(typeof soundNewRound==="function")soundNewRound();
-        if(typeof vibrate==="function")vibrate([60,50,60]);
-      },1800);
+    if(m.autoRestart && host){
+      startFreshAfterHostExit(m.name||"Host");
     }
     return;
   }
