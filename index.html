@@ -449,19 +449,21 @@ async function confirmExit(){
     if(remaining.length<2){
       await send("room_closed",{reason:"Not enough players"});
     }else if(host){
-      // Do NOT send a playing state. The remaining players first see the
-      // leave popup; the new host then creates a genuinely fresh round.
+      // Host exit: do not transfer ANY game state. The next player becomes
+      // host and creates the fresh round after everyone sees the popup.
       await send("host_left",{
+        senderId:id,
         name:me?.name||"Host",
         players:remaining,
-        newHostId:remaining[0].id,
-        autoRestart:true
+        newHostId:remaining[0].id
       });
     }else{
+      // A normal player's exit is also a hard round reset.
       await send("player_left",{
+        senderId:id,
         name:me?.name||"A player",
         players:remaining,
-        state:{...state,status:"paused",winner:null}
+        restart:true
       });
     }
   }
@@ -472,12 +474,55 @@ function showPlayerLeft(name){
   if(countdownTimer)clearInterval(countdownTimer);
   $("winnerModal").classList.remove("show");
   $("leaveTitle").textContent="🚪 "+name+" Left";
-  $("leaveSub").textContent="Player left. A fresh game is restarting automatically with the remaining players.";
+  $("leaveSub").textContent="Game stopped. A new game will start with the players who are still connected.";
   $("restartRemaining").classList.add("hide");
   $("leaveWait").textContent="New round starting…";
   $("leaveModal").classList.add("show");
   if(typeof vibrate==="function")vibrate([120,70,120]);
   if(typeof tone==="function"){tone(440,0.12,"sine",0.05);tone(330,0.18,"sine",0.05,0.14)}
+}
+
+async function createFreshRound(){
+  if(!host||!state||players.length<2)return false;
+
+  const used=[];
+  const freshGrids={};
+  const freshLines={};
+
+  players.forEach(p=>{
+    freshGrids[p.id]=uniqueGrid(used);
+    used.push(freshGrids[p.id]);
+    freshLines[p.id]=0;
+  });
+
+  state={
+    mode:"multi",
+    status:"playing",
+    round:(state.round||1)+1,
+    turn:0,
+    marks:{},
+    lines:freshLines,
+    grids:freshGrids,
+    winner:null,
+    leftPlayerName:null,
+    leftPlayerId:null
+  };
+
+  await broadcast();
+  render();
+  return true;
+}
+
+async function restartAfterDeparture(){
+  if(!host||players.length<2)return;
+  await new Promise(resolve=>setTimeout(resolve,1500));
+  if(!state||players.length<2)return;
+
+  $("leaveModal").classList.remove("show");
+  await createFreshRound();
+
+  if(typeof soundNewRound==="function")soundNewRound();
+  if(typeof vibrate==="function")vibrate([60,50,60]);
 }
 
 async function announcePlayerLeft(leftId){
@@ -488,19 +533,22 @@ async function announcePlayerLeft(leftId){
 
   const leftName=players[idx].name||("Player "+(idx+1));
   players=players.filter(p=>p.id!==leftId);
-  state.status="paused";
-  state.winner=null;
-  state.leftPlayerName=leftName;
-  state.leftPlayerId=leftId;
+
+  if(players.length<2){
+    await send("room_closed",{reason:"Not enough players"});
+    goHome();
+    return;
+  }
 
   await send("player_left",{
     name:leftName,
     players,
-    state
+    restart:true
   });
-  await broadcast();
+
   render();
   showPlayerLeft(leftName);
+  restartAfterDeparture();
 }
 
 async function checkPresence(){
@@ -526,22 +574,20 @@ async function checkPresence(){
 
   if(!hostIsPresent){
     const newHost=remaining[0];
-
-    // Only the deterministic next host initiates the migration. This avoids
-    // two remaining phones creating two different rounds.
     if(id===newHost.id){
       players=remaining;
       host=true;
       leaveHandled=false;
 
       await send("host_left",{
+        senderId:id,
         name:oldHost?.name||"Host",
         players,
-        newHostId:newHost.id,
-        autoRestart:true
+        newHostId:newHost.id
       });
 
-      startFreshAfterHostExit(oldHost?.name||"Host");
+      showPlayerLeft(oldHost?.name||"Host");
+      restartAfterDeparture();
     }
     return;
   }
@@ -550,44 +596,6 @@ async function checkPresence(){
     const missing=players.find(p=>p.id!==id&&!active.has(p.id));
     if(missing)await announcePlayerLeft(missing.id);
   }
-}
-
-async function startFreshAfterHostExit(leftName){
-  if(!host||!state||players.length<2)return;
-
-  // Keep the leave popup visible briefly, then create the new game locally
-  // and broadcast the fresh state. This guarantees the new host never gets
-  // the old host's marks, turn, winner, or grid.
-  await new Promise(resolve=>setTimeout(resolve,1600));
-
-  const used=[];
-  const freshGrids={};
-  const freshLines={};
-
-  players.forEach(p=>{
-    freshGrids[p.id]=uniqueGrid(used);
-    used.push(freshGrids[p.id]);
-    freshLines[p.id]=0;
-  });
-
-  state={
-    mode:"multi",
-    status:"playing",
-    round:(state.round||1)+1,
-    turn:0,
-    marks:{},
-    lines:freshLines,
-    grids:freshGrids,
-    winner:null,
-    leftPlayerName:null,
-    leftPlayerId:null
-  };
-
-  $("leaveModal").classList.remove("show");
-  await broadcast();
-  render();
-  if(typeof soundNewRound==="function")soundNewRound();
-  if(typeof vibrate==="function")vibrate([60,50,60]);
 }
 
 async function restartWithRemaining(){
@@ -646,7 +654,7 @@ async function handle(m){
   }
 
   if(m.type==="host_left"){
-    if(exitingGame)return;
+    if(exitingGame || m.senderId===id)return;
 
     if(Array.isArray(m.players))players=m.players;
     host=(id===(m.newHostId||players[0]?.id));
@@ -656,37 +664,42 @@ async function handle(m){
       return;
     }
 
-    // Do not apply the old game state. Pause locally while showing the leave
-    // notification, then let the new host generate a completely new round.
+    // Never accept the old host's board. Show the departure notification
+    // first; only the newly elected host creates the fresh round.
     state={...(state||{}),status:"paused",winner:null,marks:{},lines:{}};
     leaveHandled=false;
 
     render();
     showPlayerLeft(m.name||"Host");
 
-    if(m.autoRestart && host){
-      startFreshAfterHostExit(m.name||"Host");
+    if(host){
+      restartAfterDeparture();
     }
     return;
   }
 
   if(m.type==="player_left"){
-    if(exitingGame)return;
+    if(exitingGame || m.senderId===id)return;
 
-    // The sender includes the updated roster/state so everyone sees the
-    // same player list immediately.
     if(Array.isArray(m.players))players=m.players;
-    if(m.state)state=m.state;
-    else {
-      state.status="paused";
-      state.winner=null;
-    }
+
     if(players.length<2){
       goHome();
       return;
     }
+
+    // Deliberately do NOT copy the sender's old state. The current host will
+    // broadcast the fresh round shortly.
+    state={...(state||{}),status:"paused",winner:null,marks:{},lines:{}};
+    leaveHandled=false;
+
     render();
     showPlayerLeft(m.name||"A player");
+
+    // If this device is host, it owns the restart.
+    if(host && m.restart){
+      restartAfterDeparture();
+    }
     return;
   }
 
