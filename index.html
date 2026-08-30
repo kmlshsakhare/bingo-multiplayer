@@ -447,31 +447,43 @@ async function confirmExit(){
     const remaining=players.filter(p=>p.id!==id);
 
     if(remaining.length<2){
-      // After this exit fewer than two multiplayer players remain.
       await send("room_closed",{reason:"Not enough players"});
     }else if(host){
-      // Never transfer the running board. Pause it and require the new host
-      // to start a fresh round with the remaining players.
-      const newHostId=remaining[0].id;
-      const pausedState={
-        ...state,
-        status:"paused",
-        winner:null,
+      const freshGrids={};
+      const used=[];
+      const freshLines={};
+
+      remaining.forEach(p=>{
+        freshGrids[p.id]=uniqueGrid(used);
+        used.push(freshGrids[p.id]);
+        freshLines[p.id]=0;
+      });
+
+      const freshState={
+        mode:"multi",
+        status:"playing",
+        round:(state.round||1)+1,
+        turn:0,
         marks:{},
-        lines:{},
+        lines:freshLines,
+        grids:freshGrids,
+        winner:null,
         leftPlayerName:me?.name||"Host",
         leftPlayerId:id
       };
+
+      // First remaining player is the new host.
       await send("host_left",{
         name:me?.name||"Host",
         players:remaining,
-        state:pausedState,
-        newHostId
+        state:freshState,
+        newHostId:remaining[0].id,
+        autoRestart:true
       });
     }else{
       await send("player_left",{
         name:me?.name||"A player",
-        players:remaining,
+        players:players.filter(p=>p.id!==id),
         state:{...state,status:"paused",winner:null}
       });
     }
@@ -483,9 +495,9 @@ function showPlayerLeft(name){
   if(countdownTimer)clearInterval(countdownTimer);
   $("winnerModal").classList.remove("show");
   $("leaveTitle").textContent="🚪 "+name+" Left";
-  $("leaveSub").textContent="Game stopped. Restart with the players who are still connected.";
-  $("restartRemaining").classList.toggle("hide",!host);
-  $("leaveWait").textContent=host?"":"Waiting for the host to restart the game…";
+  $("leaveSub").textContent="Player left. A fresh game is restarting automatically with the remaining players.";
+  $("restartRemaining").classList.add("hide");
+  $("leaveWait").textContent="New round starting…";
   $("leaveModal").classList.add("show");
   if(typeof vibrate==="function")vibrate([120,70,120]);
   if(typeof tone==="function"){tone(440,0.12,"sine",0.05);tone(330,0.18,"sine",0.05,0.14)}
@@ -514,14 +526,13 @@ async function announcePlayerLeft(leftId){
   showPlayerLeft(leftName);
 }
 
-function checkPresence(){
+async function checkPresence(){
   if(!ch||!state||state.mode==="computer"||state.status==="waiting"||state.status==="closed")return;
 
   const ps=ch.presenceState();
   const active=new Set(Object.keys(ps));
   const remaining=players.filter(p=>active.has(p.id));
 
-  // Multiplayer cannot continue with only one connected player.
   if(remaining.length<=1){
     if(state.status!=="waiting"){
       state.status="closed";
@@ -533,45 +544,53 @@ function checkPresence(){
     return;
   }
 
-  const hostPlayer=players[0];
-  const hostIsPresent=hostPlayer && active.has(hostPlayer.id);
+  const oldHost=players[0];
+  const hostIsPresent=oldHost && active.has(oldHost.id);
 
-  // Host closed the tab/browser without using Exit Game.
-  if(!hostIsPresent){
+  if(!hostIsPresent && host){
     const newHost=remaining[0];
-    players=remaining;
-    host=(id===newHost.id);
+    const freshGrids={};
+    const used=[];
+    const freshLines={};
 
-    state.status="paused";
-    state.winner=null;
-    state.leftPlayerName=hostPlayer?.name||"Host";
-    state.leftPlayerId=hostPlayer?.id||null;
-    leaveHandled=false;
-
-    // Synchronize the paused state. Every remaining device gets the popup;
-    // only the elected host gets the restart button.
-    send("host_left",{
-      name:state.leftPlayerName,
-      players,
-      state,
-      newHostId:newHost.id
+    remaining.forEach(p=>{
+      freshGrids[p.id]=uniqueGrid(used);
+      used.push(freshGrids[p.id]);
+      freshLines[p.id]=0;
     });
 
-    render();
-    showPlayerLeft(state.leftPlayerName);
+    const freshState={
+      mode:"multi",
+      status:"playing",
+      round:(state.round||1)+1,
+      turn:0,
+      marks:{},
+      lines:freshLines,
+      grids:freshGrids,
+      winner:null,
+      leftPlayerName:oldHost?.name||"Host",
+      leftPlayerId:oldHost?.id||null
+    };
+
+    await send("host_left",{
+      name:oldHost?.name||"Host",
+      players:remaining,
+      state:freshState,
+      newHostId:newHost.id,
+      autoRestart:true
+    });
     return;
   }
 
-  // Normal player departure: only the current host handles it.
   if(host){
     const missing=players.find(p=>p.id!==id&&!active.has(p.id));
-    if(missing)announcePlayerLeft(missing.id);
+    if(missing)await announcePlayerLeft(missing.id);
   }
 }
 
 async function restartWithRemaining(){
   if(!host||!state||state.mode==="computer")return;
-  if(players.length<2){goHome();return;}
+  if(players.length<1)return;
 
   $("restartRemaining").disabled=true;
   const used=[];
@@ -618,6 +637,12 @@ async function handle(m){
     return;
   }
 
+  if(m.type==="room_closed"){
+    if(exitingGame)return;
+    goHome();
+    return;
+  }
+
   if(m.type==="host_left"){
     if(exitingGame)return;
 
@@ -629,15 +654,25 @@ async function handle(m){
       return;
     }
 
+    // New host is deterministic: first remaining player.
     host=(id===(m.newHostId||players[0].id));
-    state.status="paused";
+
+    // Use the fresh state from the host. Old marks/turn/grids are gone.
+    state.status="playing";
     state.winner=null;
-    state.leftPlayerName=m.name||"Host";
-    state.leftPlayerId=m.leftPlayerId||null;
     leaveHandled=false;
 
     render();
     showPlayerLeft(m.name||"Host");
+
+    if(m.autoRestart){
+      setTimeout(()=>{
+        $("leaveModal").classList.remove("show");
+        render();
+        if(typeof soundNewRound==="function")soundNewRound();
+        if(typeof vibrate==="function")vibrate([60,50,60]);
+      },1800);
+    }
     return;
   }
 
@@ -653,12 +688,9 @@ async function handle(m){
       state.winner=null;
     }
     if(players.length<2){
-      $("leaveModal").classList.remove("show");
-      if(host)await send("room_closed",{reason:"Not enough players"});
       goHome();
       return;
     }
-
     render();
     showPlayerLeft(m.name||"A player");
     return;
