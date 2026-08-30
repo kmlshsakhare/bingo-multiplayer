@@ -23,7 +23,7 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
 .winTrophy{font-size:58px}.winTitle{font-size:30px;font-weight:950;margin-top:4px}.winSub{font-size:16px;color:#64748b;margin-top:8px}.count{font-size:58px;font-weight:950;line-height:1;margin-top:16px}
 @keyframes pop{from{transform:scale(.72);opacity:0}to{transform:scale(1);opacity:1}}
 @media(max-width:480px){.wrap{padding:12px}.cell{font-size:17px}}
-</style>
+.exitBox{width:min(430px,92vw);background:#fff;border-radius:24px;padding:28px;text-align:center;box-shadow:0 25px 70px rgba(0,0,0,.3);animation:pop .28s ease-out}.exitIcon{font-size:48px}.exitTitle{font-size:27px;font-weight:950;margin-top:5px}.exitSub{font-size:15px;color:#64748b;margin:8px 0 18px}.exitActions{display:flex;gap:10px}.exitActions button{flex:1}.danger{background:#dc2626!important;color:#fff!important}</style>
 </head>
 <body>
 <div class="wrap">
@@ -31,6 +31,7 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
 <div class="row" style="margin-top:0">
 <button class="alt" id="soundToggle">🔊 Sound ON</button>
 <button class="alt" id="hapticToggle">📳 Haptic ON</button>
+<button class="alt" id="exitGame">🏠 Exit Game</button>
 </div></div>
 
 <section class="card" id="lobby">
@@ -64,6 +65,18 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
   <div class="grid" id="grid" style="margin-top:14px"></div>
   <div class="letters"><div class="letter">B</div><div class="letter">I</div><div class="letter">N</div><div class="letter">G</div><div class="letter">O</div></div>
 </section>
+</div>
+
+<div class="winnerModal" id="exitModal">
+  <div class="exitBox">
+    <div class="exitIcon">🏠</div>
+    <div class="exitTitle">Exit Game?</div>
+    <div class="exitSub">You are currently playing with other players. If you exit, the game will stop for everyone and the remaining players can restart.</div>
+    <div class="exitActions">
+      <button class="alt" id="cancelExit">Cancel</button>
+      <button class="danger" id="confirmExit">Exit Game</button>
+    </div>
+  </div>
 </div>
 
 <div class="winnerModal" id="leaveModal">
@@ -105,6 +118,7 @@ let countdownTimer=null;
 let lastWinnerRound=null;
 let presenceTimer=null;
 let leaveHandled=false;
+let exitingGame=false;
 
 const $=x=>document.getElementById(x);
 
@@ -372,6 +386,74 @@ function showWinnerCountdown(winnerIndex,roundId){
 }
 
 
+
+function otherConnectedPlayers(){
+  if(!state || state.mode==="computer" || !ch)return 0;
+  const ps=ch.presenceState();
+  const active=new Set(Object.keys(ps));
+  return players.filter(p=>p.id!==id && active.has(p.id)).length;
+}
+
+function goHome(){
+  if(countdownTimer)clearInterval(countdownTimer);
+  if(ch){
+    try{ch.untrack()}catch(e){}
+    try{sb.removeChannel(ch)}catch(e){}
+  }
+  ch=null;
+  room="";
+  host=false;
+  players=[];
+  state=null;
+  computerBusy=false;
+  leaveHandled=false;
+  exitingGame=false;
+
+  $("exitModal").classList.remove("show");
+  $("leaveModal").classList.remove("show");
+  $("winnerModal").classList.remove("show");
+  $("game").classList.add("hide");
+  $("lobby").classList.remove("hide");
+  $("room").classList.add("hide");
+  $("status").textContent="Ready • Create or Join a game";
+  $("code").value="";
+  $("playerName").value="";
+  $("start").disabled=true;
+  $("start").textContent="Start Game (need 2 players)";
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+async function requestExit(){
+  if(!state || state.mode==="computer"){
+    goHome();
+    return;
+  }
+
+  const others=otherConnectedPlayers();
+  if(others<=0){
+    goHome();
+    return;
+  }
+
+  $("exitModal").classList.add("show");
+}
+
+async function confirmExit(){
+  if(!state)return;
+  exitingGame=true;
+
+  // Tell other players explicitly as well as relying on presence.
+  const me=players.find(p=>p.id===id);
+  if(ch){
+    await send("player_left",{
+      name:me?.name||"A player",
+      players:players.filter(p=>p.id!==id),
+      state:{...state,status:"paused",winner:null}
+    });
+  }
+  goHome();
+}
+
 function showPlayerLeft(name){
   if(countdownTimer)clearInterval(countdownTimer);
   $("winnerModal").classList.remove("show");
@@ -465,7 +547,10 @@ async function handle(m){
   }
 
   if(m.type==="player_left"){
-    // The host sends the updated roster with the leave event.
+    if(exitingGame)return;
+
+    // The sender includes the updated roster/state so everyone sees the
+    // same player list immediately.
     if(Array.isArray(m.players))players=m.players;
     if(m.state)state=m.state;
     else {
@@ -556,6 +641,10 @@ async function connect(c,isHost){
   });
 }
 
+
+$("exitGame").onclick=requestExit;
+$("cancelExit").onclick=()=>$("exitModal").classList.remove("show");
+$("confirmExit").onclick=confirmExit;
 
 $("soundToggle").onclick=()=>{
   soundOn=!soundOn;
