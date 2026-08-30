@@ -36,7 +36,7 @@ button.alt{background:#e5e7eb;color:#111827}button:disabled{opacity:.45;cursor:n
 <section class="card" id="lobby">
   <div class="row">
     <select id="mode" style="padding:12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit">
-      <option value="multi">👥 Multiplayer</option>
+      <option value="multi" selected>👥 Multiplayer</option>
       <option value="computer">🤖 vs Computer</option>
     </select>
     <select id="difficulty" class="hide" style="padding:12px;border:1px solid #cbd5e1;border-radius:10px;font:inherit">
@@ -90,7 +90,7 @@ const colors=[
 ];
 
 const id=crypto.randomUUID();
-let ch=null,room="",host=false,players=[],state=null,computerBusy=false;
+let ch=null,room="",host=false,players=[],state=null,computerBusy=false,gameMode="multi";
 let countdownTimer=null;
 let lastWinnerRound=null;
 
@@ -375,9 +375,10 @@ async function handle(m){
     return;
   }
 
-  if(m.type==="snapshot" && state?.mode!=="computer"){
+  if(m.type==="snapshot"){
     players=m.players;
     state=m.state;
+    if(!state.mode)state.mode="multi";
 
     render();
 
@@ -493,6 +494,7 @@ $("create").onclick=async()=>{
     return;
   }
 
+  gameMode="multi";
   room="BINGO-"+(1000+Math.floor(Math.random()*9000));
   host=true;
 
