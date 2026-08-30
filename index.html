@@ -119,6 +119,7 @@ let lastWinnerRound=null;
 let presenceTimer=null;
 let leaveHandled=false;
 let exitingGame=false;
+let departureHomeHandled=false;
 
 const $=x=>document.getElementById(x);
 
@@ -447,7 +448,12 @@ async function confirmExit(){
     const remaining=players.filter(p=>p.id!==id);
 
     if(remaining.length<2){
-      await send("room_closed",{reason:"Not enough players"});
+      await send("player_left",{
+        senderId:id,
+        name:me?.name||"A player",
+        players:remaining,
+        finalPlayer:true
+      });
     }else if(host){
       // Host exit: do not transfer ANY game state. The next player becomes
       // host and creates the fresh round after everyone sees the popup.
@@ -482,8 +488,32 @@ function showPlayerLeft(name){
   if(typeof tone==="function"){tone(440,0.12,"sine",0.05);tone(330,0.18,"sine",0.05,0.14)}
 }
 
+function showPlayerLeftAndReturnHome(name){
+  if(departureHomeHandled)return;
+  departureHomeHandled=true;
+
+  if(countdownTimer)clearInterval(countdownTimer);
+  $("winnerModal").classList.remove("show");
+  $("leaveTitle").textContent="🚪 "+name+" Left";
+  $("leaveSub").textContent="The game has ended because only one player remains.";
+  $("restartRemaining").classList.add("hide");
+  $("leaveWait").textContent="Returning to the home page…";
+  $("leaveModal").classList.add("show");
+
+  if(typeof vibrate==="function")vibrate([120,70,120]);
+  if(typeof tone==="function"){
+    tone(440,0.12,"sine",0.05);
+    tone(330,0.18,"sine",0.05,0.14);
+  }
+
+  setTimeout(()=>{
+    if(typeof goHome==="function")goHome();
+  },2200);
+}
+
 async function createFreshRound(){
   if(!host||!state||players.length<2)return false;
+  departureHomeHandled=false;
 
   const used=[];
   const freshGrids={};
@@ -560,11 +590,11 @@ async function checkPresence(){
 
   if(remaining.length<=1){
     if(state.status!=="waiting"){
+      const departed=players.find(p=>p.id!==id&&!active.has(p.id));
+      const departedName=departed?.name||"A player";
       state.status="closed";
-      $("leaveModal").classList.remove("show");
-      $("winnerModal").classList.remove("show");
       render();
-      setTimeout(goHome,250);
+      showPlayerLeftAndReturnHome(departedName);
     }
     return;
   }
@@ -649,7 +679,9 @@ async function handle(m){
 
   if(m.type==="room_closed"){
     if(exitingGame)return;
-    goHome();
+    state={...(state||{}),status:"closed"};
+    render();
+    showPlayerLeftAndReturnHome(m.name||"A player");
     return;
   }
 
@@ -660,7 +692,9 @@ async function handle(m){
     host=(id===(m.newHostId||players[0]?.id));
 
     if(players.length<2){
-      goHome();
+      state={...(state||{}),status:"closed",winner:null};
+      render();
+      showPlayerLeftAndReturnHome(m.name||"Host");
       return;
     }
 
@@ -684,7 +718,9 @@ async function handle(m){
     if(Array.isArray(m.players))players=m.players;
 
     if(players.length<2){
-      goHome();
+      state={...(state||{}),status:"closed",winner:null};
+      render();
+      showPlayerLeftAndReturnHome(m.name||"A player");
       return;
     }
 
